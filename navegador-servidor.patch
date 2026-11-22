@@ -1,0 +1,539 @@
+diff -ruN a/DirectPackageInstaller/DirectPackageInstaller/App.axaml.cs b/DirectPackageInstaller/DirectPackageInstaller/App.axaml.cs
+--- a/DirectPackageInstaller/DirectPackageInstaller/App.axaml.cs	2026-11-22 10:59:02.045616527 +0000
++++ b/DirectPackageInstaller/DirectPackageInstaller/App.axaml.cs	2026-11-22 10:59:02.046811885 +0000
+@@ -144,6 +144,7 @@
+                 IniWriter.SetValue("RealDebridApiKey", Config.RealDebridApiKey);
+                 IniWriter.SetValue("UseDebridLink", Config.UseDebridLink.ToString());
+                 IniWriter.SetValue("DebridLinkApiKey", Config.DebridLinkApiKey);
++                IniWriter.SetValue("ServerURL", Config.ServerURL);
+                 IniWriter.SetValue("EnableCNL", Config.EnableCNL.ToString());
+                 IniWriter.SetValue("Concurrency", SegmentedStream.DefaultConcurrency.ToString());
+                 IniWriter.SetValue("ShowError", Config.ShowError.ToString());
+diff -ruN a/DirectPackageInstaller/DirectPackageInstaller/Others/Settings.cs b/DirectPackageInstaller/DirectPackageInstaller/Others/Settings.cs
+--- a/DirectPackageInstaller/DirectPackageInstaller/Others/Settings.cs	2026-11-22 10:59:02.038067684 +0000
++++ b/DirectPackageInstaller/DirectPackageInstaller/Others/Settings.cs	2026-11-22 10:59:02.038986481 +0000
+@@ -13,6 +13,7 @@
+         public string AllDebridApiKey;
+         public string RealDebridApiKey;
+         public string DebridLinkApiKey;
++        public string ServerURL;
+         public string PSIP;
+         public string PCIP;
+ 
+diff -ruN a/DirectPackageInstaller/DirectPackageInstaller/Tasks/ServerListing.cs b/DirectPackageInstaller/DirectPackageInstaller/Tasks/ServerListing.cs
+--- a/DirectPackageInstaller/DirectPackageInstaller/Tasks/ServerListing.cs	1970-01-01 00:00:00.000000000 +0000
++++ b/DirectPackageInstaller/DirectPackageInstaller/Tasks/ServerListing.cs	2026-11-22 10:59:02.047735105 +0000
+@@ -0,0 +1,345 @@
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.Linq;
++using System.Net;
++using System.Net.Http;
++using System.Text.Json;
++using System.Text.RegularExpressions;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace DirectPackageInstaller.Tasks;
++
++/// <summary>
++/// A package found on a remote file server.
++/// </summary>
++/// <param name="Url">Full (escaped) download URL.</param>
++/// <param name="Path">Readable path relative to the server root (folder/file.pkg).</param>
++/// <param name="Size">Size in bytes when the server told us.</param>
++public sealed record ServerEntry(string Url, string Path, long? Size)
++{
++    public string Display => Size is { } S ? $"{Path} ({ServerListing.FormatSize(S)})" : Path;
++}
++
++/// <summary>
++/// Lists the .pkg files of a remote server. Two formats are understood:
++///
++/// 1) JSON (recommended), for example:
++///    { "files": [ { "path": "God of War/GoW.pkg", "size": 123456, "title": "God of War" } ] }
++///    Also accepted: a plain array of strings/objects, nested folders ("children"/"files"/"items"),
++///    and absolute "url" values. Relative values are resolved against the server URL and must be RAW
++///    (not percent-encoded), because each segment is escaped here.
++///
++/// 2) HTML directory listing (python http.server, nginx/apache autoindex...): the links are followed
++///    recursively (same host, limited depth) and every link ending in .pkg is listed.
++/// </summary>
++public static class ServerListing
++{
++    private const int MaxDepth = 4;
++    private const int MaxRequests = 300;
++
++    private static readonly string[] FullRefKeys = { "url", "href", "link", "path", "file", "filename" };
++    private static readonly string[] SizeKeys = { "size", "bytes", "length" };
++
++    private static readonly Regex HrefRegex = new Regex("href\\s*=\\s*[\"']([^\"']+)[\"']", RegexOptions.IgnoreCase | RegexOptions.Compiled);
++
++    private static readonly HttpClient Http = CreateClient();
++
++    private static HttpClient CreateClient()
++    {
++        var Client = new HttpClient(new HttpClientHandler { AutomaticDecompression = DecompressionMethods.All })
++        {
++            Timeout = TimeSpan.FromSeconds(30)
++        };
++        Client.DefaultRequestHeaders.UserAgent.ParseAdd("DirectPackageInstaller");
++        Client.DefaultRequestHeaders.Accept.ParseAdd("application/json, text/html;q=0.9, */*;q=0.1");
++        return Client;
++    }
++
++    public static async Task<List<ServerEntry>> FetchPackages(string ServerUrl, CancellationToken Token = default)
++    {
++        if (!Uri.TryCreate(ServerUrl?.Trim(), UriKind.Absolute, out var Start) ||
++            (Start.Scheme != Uri.UriSchemeHttp && Start.Scheme != Uri.UriSchemeHttps))
++            throw new ArgumentException("Invalid server URL");
++
++        var (Body, Final) = await Get(Start, Token);
++
++        List<ServerEntry> Entries;
++        var Trimmed = Body.TrimStart('\uFEFF', ' ', '\t', '\r', '\n');
++        if (Trimmed.StartsWith("{") || Trimmed.StartsWith("["))
++            Entries = ParseJson(Trimmed, Final);
++        else
++            Entries = await ParseHtmlTree(Body, Final, Token);
++
++        return Entries
++            .GroupBy(x => x.Url)
++            .Select(x => x.First())
++            .OrderBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
++            .ToList();
++    }
++
++    private static async Task<(string Body, Uri Final)> Get(Uri Url, CancellationToken Token)
++    {
++        using var Response = await Http.GetAsync(Url, HttpCompletionOption.ResponseHeadersRead, Token);
++
++        if (!Response.IsSuccessStatusCode)
++            throw new HttpRequestException($"The server answered {(int)Response.StatusCode} {Response.ReasonPhrase} for {Url}");
++
++        var Body = await Response.Content.ReadAsStringAsync(Token);
++        return (Body, Response.RequestMessage?.RequestUri ?? Url);
++    }
++
++    /// <summary>
++    /// The "directory" that relative paths are resolved against: always ends with '/'
++    /// and drops a trailing file name such as index.html or manifest.json.
++    /// </summary>
++    public static Uri AsDirectory(Uri Url)
++    {
++        var Builder = new UriBuilder(Url) { Query = string.Empty, Fragment = string.Empty };
++        var Path = Builder.Path;
++
++        if (!Path.EndsWith("/"))
++        {
++            var Last = Path.Substring(Path.LastIndexOf('/') + 1);
++            Path = Last.Contains('.') ? Path.Substring(0, Path.LastIndexOf('/') + 1) : Path + "/";
++        }
++
++        Builder.Path = Path;
++        return Builder.Uri;
++    }
++
++    private static string EscapePath(string Path) =>
++        string.Join("/", Path.Split('/').Select(Uri.EscapeDataString));
++
++    private static bool IsPkg(string? Name) =>
++        Name != null && Name.EndsWith(".pkg", StringComparison.OrdinalIgnoreCase);
++
++    #region JSON
++
++    public static List<ServerEntry> ParseJson(string Json, Uri ServerUrl)
++    {
++        var Result = new List<ServerEntry>();
++        var Base = AsDirectory(ServerUrl);
++
++        using var Doc = JsonDocument.Parse(Json, new JsonDocumentOptions { AllowTrailingCommas = true });
++        WalkJson(Doc.RootElement, string.Empty, Base, Result, 0);
++        return Result;
++    }
++
++    private static string? GetString(JsonElement Obj, string Key)
++    {
++        foreach (var Prop in Obj.EnumerateObject())
++            if (Prop.Name.Equals(Key, StringComparison.OrdinalIgnoreCase) && Prop.Value.ValueKind == JsonValueKind.String)
++                return Prop.Value.GetString();
++        return null;
++    }
++
++    private static long? GetSize(JsonElement Obj)
++    {
++        foreach (var Key in SizeKeys)
++        foreach (var Prop in Obj.EnumerateObject())
++        {
++            if (!Prop.Name.Equals(Key, StringComparison.OrdinalIgnoreCase))
++                continue;
++
++            if (Prop.Value.ValueKind == JsonValueKind.Number && Prop.Value.TryGetInt64(out var Num))
++                return Num;
++
++            if (Prop.Value.ValueKind == JsonValueKind.String && long.TryParse(Prop.Value.GetString(), NumberStyles.None, CultureInfo.InvariantCulture, out Num))
++                return Num;
++        }
++        return null;
++    }
++
++    private static string Combine(string Folder, string Name) =>
++        string.IsNullOrEmpty(Folder) ? Name : Folder.TrimEnd('/') + "/" + Name.TrimStart('/');
++
++    private static void WalkJson(JsonElement Element, string Folder, Uri Base, List<ServerEntry> Result, int Depth)
++    {
++        if (Depth > 12)
++            return;
++
++        switch (Element.ValueKind)
++        {
++            case JsonValueKind.Array:
++                foreach (var Item in Element.EnumerateArray())
++                {
++                    if (Item.ValueKind == JsonValueKind.String)
++                    {
++                        var Text = Item.GetString();
++                        if (IsPkg(Text))
++                            AddJsonEntry(Text!, false, Folder, null, Base, Result);
++                    }
++                    else
++                        WalkJson(Item, Folder, Base, Result, Depth + 1);
++                }
++                break;
++
++            case JsonValueKind.Object:
++                string? Ref = null;
++                bool IsName = false;
++
++                foreach (var Key in FullRefKeys)
++                {
++                    Ref = GetString(Element, Key);
++                    if (!string.IsNullOrWhiteSpace(Ref))
++                        break;
++                }
++
++                if (string.IsNullOrWhiteSpace(Ref))
++                {
++                    Ref = GetString(Element, "name");
++                    IsName = true;
++                }
++
++                if (IsPkg(Ref))
++                {
++                    AddJsonEntry(Ref!, IsName, Folder, GetSize(Element), Base, Result);
++                    return;
++                }
++
++                //Not a package, maybe a folder: the child names are relative to it
++                var ChildFolder = Folder;
++                if (!string.IsNullOrWhiteSpace(Ref) && !Ref!.StartsWith("http", StringComparison.OrdinalIgnoreCase))
++                    ChildFolder = IsName ? Combine(Folder, Ref) : Ref;
++
++                foreach (var Prop in Element.EnumerateObject())
++                    if (Prop.Value.ValueKind is JsonValueKind.Array or JsonValueKind.Object)
++                        WalkJson(Prop.Value, ChildFolder, Base, Result, Depth + 1);
++                break;
++        }
++    }
++
++    private static void AddJsonEntry(string Ref, bool IsName, string Folder, long? Size, Uri Base, List<ServerEntry> Result)
++    {
++        if (Uri.TryCreate(Ref, UriKind.Absolute, out var Absolute) &&
++            (Absolute.Scheme == Uri.UriSchemeHttp || Absolute.Scheme == Uri.UriSchemeHttps))
++        {
++            Result.Add(new ServerEntry(Absolute.AbsoluteUri, RelativeName(Absolute, Base), Size));
++            return;
++        }
++
++        string Relative;
++
++        if (Ref.StartsWith("/"))
++        {
++            //Host-relative: /something/file.pkg
++            var HostRelative = new Uri(new Uri(Base.GetLeftPart(UriPartial.Authority)), EscapePath(Ref.TrimStart('/')));
++            Result.Add(new ServerEntry(HostRelative.AbsoluteUri, Uri.UnescapeDataString(Ref.TrimStart('/')), Size));
++            return;
++        }
++
++        Relative = IsName ? Combine(Folder, Ref) : Ref;
++        Relative = Relative.Replace('\\', '/').TrimStart('/');
++
++        var Url = new Uri(Base, EscapePath(Relative));
++        Result.Add(new ServerEntry(Url.AbsoluteUri, Relative, Size));
++    }
++
++    private static string RelativeName(Uri Url, Uri Base)
++    {
++        var BasePath = Base.AbsolutePath;
++        var Path = Url.AbsolutePath;
++
++        if (Url.Authority.Equals(Base.Authority, StringComparison.OrdinalIgnoreCase) &&
++            Path.StartsWith(BasePath, StringComparison.OrdinalIgnoreCase))
++            Path = Path.Substring(BasePath.Length);
++        else
++            Path = Path.Substring(Path.LastIndexOf('/') + 1);
++
++        return Uri.UnescapeDataString(Path);
++    }
++
++    #endregion
++
++    #region HTML
++
++    private static async Task<List<ServerEntry>> ParseHtmlTree(string FirstBody, Uri FirstUrl, CancellationToken Token)
++    {
++        var Result = new List<ServerEntry>();
++        var Base = AsDirectory(FirstUrl);
++        var Visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Base.AbsoluteUri };
++        int Requests = 1;
++
++        async Task Crawl(Uri Dir, string? Body, int Depth)
++        {
++            if (Body == null)
++            {
++                Requests++;
++                try { (Body, _) = await Get(Dir, Token); }
++                catch (HttpRequestException) { return; } //A folder that can't be opened is just skipped
++            }
++
++            foreach (var Hit in ParseHtmlLinks(Body, Dir, Base))
++            {
++                if (Hit.IsFolder)
++                {
++                    if (Depth < MaxDepth && Requests < MaxRequests && Visited.Add(Hit.Url.AbsoluteUri))
++                        await Crawl(Hit.Url, null, Depth + 1);
++                }
++                else
++                    Result.Add(new ServerEntry(Hit.Url.AbsoluteUri, RelativeName(Hit.Url, Base), null));
++            }
++        }
++
++        await Crawl(Base, FirstBody, 0);
++        return Result;
++    }
++
++    public static List<(Uri Url, bool IsFolder)> ParseHtmlLinks(string Html, Uri Dir, Uri Base)
++    {
++        var Hits = new List<(Uri, bool)>();
++
++        foreach (Match Match in HrefRegex.Matches(Html))
++        {
++            var Href = WebUtility.HtmlDecode(Match.Groups[1].Value).Trim();
++
++            if (Href.Length == 0 || Href[0] == '#' || Href[0] == '?' ||
++                Href.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase) ||
++                Href.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase))
++                continue;
++
++            if (!Uri.TryCreate(Dir, Href, out var Link))
++                continue;
++
++            if (Link.Scheme != Uri.UriSchemeHttp && Link.Scheme != Uri.UriSchemeHttps)
++                continue;
++
++            if (!Link.Authority.Equals(Base.Authority, StringComparison.OrdinalIgnoreCase))
++                continue;
++
++            var Path = Link.AbsolutePath;
++
++            if (Path.EndsWith("/"))
++            {
++                //Folders: only the ones below the server folder (ignores "parent directory" links)
++                if (Path.StartsWith(Base.AbsolutePath, StringComparison.OrdinalIgnoreCase) && Path.Length > Base.AbsolutePath.Length)
++                    Hits.Add((new UriBuilder(Link) { Query = string.Empty, Fragment = string.Empty }.Uri, true));
++            }
++            else if (IsPkg(Uri.UnescapeDataString(Path)))
++                Hits.Add((new UriBuilder(Link) { Fragment = string.Empty }.Uri, false));
++        }
++
++        return Hits;
++    }
++
++    #endregion
++
++    public static string FormatSize(long Bytes)
++    {
++        string[] Units = { "B", "KB", "MB", "GB", "TB" };
++        double Value = Bytes;
++        int Unit = 0;
++
++        while (Value >= 1024 && Unit < Units.Length - 1)
++        {
++            Value /= 1024;
++            Unit++;
++        }
++
++        return Unit == 0
++            ? $"{Bytes} B"
++            : string.Format(CultureInfo.InvariantCulture, "{0:0.##} {1}", Value, Units[Unit]);
++    }
++}
+diff -ruN a/DirectPackageInstaller/DirectPackageInstaller/ViewModels/MainViewModel.cs b/DirectPackageInstaller/DirectPackageInstaller/ViewModels/MainViewModel.cs
+--- a/DirectPackageInstaller/DirectPackageInstaller/ViewModels/MainViewModel.cs	2026-11-22 10:59:02.039945814 +0000
++++ b/DirectPackageInstaller/DirectPackageInstaller/ViewModels/MainViewModel.cs	2026-11-22 10:59:02.040967072 +0000
+@@ -62,6 +62,13 @@
+             set => this.RaiseAndSetIfChanged(ref _debridLinkApiKey, value);
+         }
+ 
++        private string _serverURL = null;
++        public string ServerURL
++        {
++            get => _serverURL;
++            set => this.RaiseAndSetIfChanged(ref _serverURL, value);
++        }
++
+         private bool _ProxyMode = false;
+         public bool ProxyMode 
+         {
+diff -ruN a/DirectPackageInstaller/DirectPackageInstaller/Views/MainView.axaml b/DirectPackageInstaller/DirectPackageInstaller/Views/MainView.axaml
+--- a/DirectPackageInstaller/DirectPackageInstaller/Views/MainView.axaml	2026-11-22 10:59:02.041873551 +0000
++++ b/DirectPackageInstaller/DirectPackageInstaller/Views/MainView.axaml	2026-11-22 10:59:02.042771556 +0000
+@@ -98,6 +98,15 @@
+                 <MenuItem Header="_Restart Server" Name="btnRestartServer"/>
+                 <MenuItem Header="_Exit" Name="btnExit"/>
+             </MenuItem>
++            <MenuItem Header="_Server">
++                <MenuItem Header="_Address" Classes="NoChildFocus">
++                    <StackPanel Orientation="Horizontal">
++                        <Label Grid.Column="0">URL</Label>
++                        <TextBox Grid.Column="1" Width="320" Watermark="https://my-server:10000/files" Text="{Binding ServerURL, Mode=TwoWay}"></TextBox>
++                    </StackPanel>
++                </MenuItem>
++                <MenuItem Header="_Load Package List" Name="btnServerLoad"/>
++            </MenuItem>
+             <MenuItem Header="Packages" IsVisible="False" Name="PackagesMenu">
+                 <Separator></Separator>
+                 <MenuItem Header="Install _All" Name="btnInstallAll"></MenuItem>
+diff -ruN a/DirectPackageInstaller/DirectPackageInstaller/Views/MainView.axaml.cs b/DirectPackageInstaller/DirectPackageInstaller/Views/MainView.axaml.cs
+--- a/DirectPackageInstaller/DirectPackageInstaller/Views/MainView.axaml.cs	2026-11-22 10:59:02.043656260 +0000
++++ b/DirectPackageInstaller/DirectPackageInstaller/Views/MainView.axaml.cs	2026-11-22 10:59:02.044657412 +0000
+@@ -88,6 +88,7 @@
+             btnDHCPService = this.Find<MenuItem>("btnDHCPService");
+             btnExit = this.Find<MenuItem>("btnExit");
+             btnLoad = this.Find<Button>("btnLoad");
++            btnServerLoad = this.Find<MenuItem>("btnServerLoad");
+             
+             btnInstallAll.Click += BtnInstallAllOnClick;
+             btnRestartServer.Click += RestartServer_OnClick;
+@@ -101,6 +102,7 @@
+             btnDHCPService.Click += BtnDHCPServiceOnClick;
+ 
+             btnLoad.Click += BtnLoadOnClick;
++            btnServerLoad.Click += BtnServerLoadOnClick;
+ 
+             tbURL.GotFocus += tbURLOnGotFocus;
+ 
+@@ -148,6 +150,7 @@
+                 App.Config.UseDebridLink = IniReader.GetBooleanValue("UseDebridLink");
+                 App.Config.RealDebridApiKey = IniReader.GetValue("RealDebridApiKey");
+                 App.Config.DebridLinkApiKey = IniReader.GetValue("DebridLinkApiKey");
++                App.Config.ServerURL = IniReader.GetValue("ServerURL");
+                 App.Config.EnableCNL = IniReader.GetBooleanValue("EnableCNL");
+                 App.Config.ShowError = IniReader.GetBooleanValue("ShowError");
+                 var ShowTransferProgress = IniReader.GetValue("ShowTransferProgress");
+@@ -213,6 +216,7 @@
+             Model.AllDebridApiKey = App.Config.AllDebridApiKey;
+             Model.RealDebridApiKey = App.Config.RealDebridApiKey;
+             Model.DebridLinkApiKey = App.Config.DebridLinkApiKey;
++            Model.ServerURL = App.Config.ServerURL;
+              
+             if (App.Config.SearchPS4 || string.IsNullOrEmpty(App.Config.PSIP))
+             {
+@@ -846,6 +850,9 @@
+                 case "DebridLinkApiKey":
+                     App.Config.DebridLinkApiKey = Model.DebridLinkApiKey;
+                     break;
++                case "ServerURL":
++                    App.Config.ServerURL = Model.ServerURL;
++                    break;
+                 case "DHCPService":
+                     App.Config.EnableDHCP = Model.DHCPService;
+                     break;
+@@ -977,6 +984,59 @@
+             }
+         }
+         
++        private async void BtnServerLoadOnClick(object? sender, RoutedEventArgs e)
++        {
++            var ServerUrl = Model?.ServerURL?.Trim();
++
++            if (string.IsNullOrWhiteSpace(ServerUrl) || !ServerUrl.IsValidURL())
++            {
++                await MessageBox.ShowAsync("Type the server address in Server > Address first.\nExample: https://my-server:10000/files", "DirectPackageInstaller", MessageBoxButtons.OK, MessageBoxIcon.Warning);
++                return;
++            }
++
++            var OriStatus = Status.Text;
++            btnServerLoad.IsEnabled = false;
++
++            try
++            {
++                await SetStatus("Loading the server package list...");
++
++                var Entries = await ServerListing.FetchPackages(ServerUrl);
++
++                if (Entries.Count == 0)
++                {
++                    await SetStatus(OriStatus);
++                    await MessageBox.ShowAsync("No .pkg file was found at this address.", "DirectPackageInstaller", MessageBoxButtons.OK, MessageBoxIcon.Information);
++                    return;
++                }
++
++                BatchList.Clear();
++
++                if (Entries.Count == 1)
++                {
++                    //Single package: just fill the URL box, press Load/Open as usual
++                    tbURL.Text = Entries[0].Url;
++                    await SetStatus("1 package found on the server.");
++                    return;
++                }
++
++                BatchList.AddRange(Entries.Select(x => (x.Url, x.Display)));
++                ListEntries(Entries.Select(x => x.Url).ToArray());
++                PackagesMenu.IsVisible = true;
++
++                await SetStatus($"{Entries.Count} packages found. Choose one in the Packages menu.");
++            }
++            catch (Exception ex)
++            {
++                await SetStatus(OriStatus);
++                await MessageBox.ShowAsync("Failed to load the server list:\n" + ex.Message, "DirectPackageInstaller", MessageBoxButtons.OK, MessageBoxIcon.Error);
++            }
++            finally
++            {
++                btnServerLoad.IsEnabled = true;
++            }
++        }
++
+         private async void BtnInstallAllOnClick(object? sender, RoutedEventArgs? e)
+         {
+             if (e != null)
+@@ -988,6 +1048,13 @@
+             if (!BatchList.Any() && (Installer.CurrentFileList == null || CurrentDecompressor == null))
+                 return;
+ 
++            //Server lists are URL lists, the queue for them isn't implemented yet
++            if (BatchList.Any() && BatchList.All(x => x.Source.StartsWith("http", StringComparison.OrdinalIgnoreCase)))
++            {
++                await MessageBox.ShowAsync("Install All isn't available for server lists yet.\nPick a package in the Packages menu, then press Install.", "DirectPackageInstaller", MessageBoxButtons.OK, MessageBoxIcon.Information);
++                return;
++            }
++
+             bool ErrorIgnored = false;
+ 
+             var Files = Installer.CurrentFileList ?? BatchList.Select(x => x.Source);
+@@ -1095,9 +1162,11 @@
+ 
+                 foreach (var Entry in PKGList.OrderByDescending(x=>x))
+                 {
++                    var ListName = BatchList.FirstOrDefault(x => x.Source == Entry).Name;
++
+                     var Item = new MenuItem()
+                     {
+-                        Header = Path.GetFileName(Entry),
++                        Header = string.IsNullOrEmpty(ListName) ? Path.GetFileName(Entry) : ListName,
+                         DataContext = Entry
+                     };
+                     

@@ -1,0 +1,15 @@
+﻿*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.cache
+*.pdb
+*.exe
+**/obj/**
+*.dll
+*.class
+**/bin/**
+.vs/
+/DHCPServer/Setup/Debug
+/DHCPServer/Setup/Release
